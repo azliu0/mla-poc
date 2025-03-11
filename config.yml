@@ -1,0 +1,9 @@
+- name: mla_poc
+  params:
+    vocab_size: 50000
+    d_model: 1024
+    d_head: 64
+    d_kv_latent: 128
+    num_heads: 64
+    num_layers: 4
+    max_seq_length: 2048
