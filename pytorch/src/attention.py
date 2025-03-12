@@ -98,7 +98,7 @@ class BaseAttention(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, use_cache: bool) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         pass
 
 
@@ -111,6 +111,7 @@ class MultiHeadAttention(BaseAttention):
         max_batch_size: int,
         max_seq_len: int,
         device: torch.device,
+        use_cache: bool,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -127,6 +128,8 @@ class MultiHeadAttention(BaseAttention):
         self.out_proj = nn.Linear(d_head * num_heads, d_model)
 
         self.device = device
+        self.use_cache = use_cache
+
         self.kv_cache = None
 
     def forward_no_cache(self, x: torch.Tensor) -> torch.Tensor:
@@ -213,8 +216,8 @@ class MultiHeadAttention(BaseAttention):
 
         return output
 
-    def forward(self, x: torch.Tensor, use_cache: bool) -> torch.Tensor:
-        if use_cache:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_cache:
             return self.forward_with_cache(x)
         else:
             return self.forward_no_cache(x)
@@ -230,6 +233,7 @@ class MultiHeadLatentAttention(BaseAttention):
         max_seq_len: int,
         d_kv_latent: int,
         device: torch.device,
+        use_cache: bool,
     ):
         super().__init__()
         self.d_model = d_model
@@ -241,20 +245,88 @@ class MultiHeadLatentAttention(BaseAttention):
 
         self.downsample = nn.Linear(d_model, d_kv_latent, bias=False)
 
+        # for un-cached forward pass
         self.upsample_key = nn.Linear(d_kv_latent, d_head * num_heads, bias=False)
         self.upsample_value = nn.Linear(d_kv_latent, d_head * num_heads, bias=False)
-
         self.q_proj = nn.Linear(d_model, d_head * num_heads, bias=False)
         self.out_proj = nn.Linear(d_head * num_heads, d_model, bias=False)
 
         self.device = device
 
-        # Invariant: all three of these are None or populated
+        self.use_cache = use_cache
+
+        # for cached forward pass
+        # (b, s, d_kv_latent)
         self.latent_cache = None
+        # (n_h, d_m, d_c)
         self.q_uk_combined = None
+        # (n_h, d_m, d_c)
         self.out_uv_combined = None
 
+        # normal architecture:
+        #   4 * d_m * d_h * n_h
+        # cached mla architecture (q_uk_combined and out_uv_combined):
+        #   2 * d_m * d_c * n_h
+        # therefore if we want model inference to be comparable in size we should set d_c = 2 * d_h
+        # normal kv cache:
+        #   2 * b * s * n_h * d_h
+        #   2 * 1 * 2048 * 64 * 64 * 4 bytes/param = 64MiB
+        # cached mla kv cache:
+        #   b * s * d_c
+        #   1 * 2048 * 128 * 4 bytes/param = 1MiB
+        # therefore we expect 2 * n_h * d_h / d_c = n_h times smaller kv cache for mla
+
+    def _prepare_cache_matrices(self):
+        assert self.q_proj is not None
+        assert self.upsample_key is not None
+        assert self.out_proj is not None
+        assert self.upsample_value is not None
+
+        # cache W^Q^T @ W_UK over the head dimension to avoid recomputation
+        # (d_h * n_h, d_m) -> (n_h, d_h, d_m)
+        q_weight = self.q_proj.weight.view(self.num_heads, self.d_head, self.d_model)
+        # (n_h, d_h, d_m) -> (n_h, d_m, d_h)
+        q_weight = q_weight.transpose(1, 2)
+
+        # (d_h * n_h, d_c) -> (n_h, d_h, d_c)
+        uk_weight = self.upsample_key.weight.view(
+            self.num_heads, self.d_head, self.d_kv_latent
+        )
+
+        # (n_h, d_m, d_h) * (n_h, d_h, d_c) -> (n_h, d_m, d_c)
+        self.q_uk_combined = torch.matmul(q_weight, uk_weight)
+
+        # cache W_O @ W_UV over the head dimension to avoid recomputation
+        # (d_m, d_h * n_h) -> (d_m, n_h, d_h)
+        o_weight = self.out_proj.weight.view(self.d_model, self.num_heads, self.d_head)
+        # (d_m, n_h, d_h) -> (n_h, d_m, d_h)
+        o_weight = o_weight.transpose(0, 1)
+
+        # (d_h * n_h, d_c) -> (n_h, d_h, d_c)
+        uv_weight = self.upsample_value.weight.view(
+            self.num_heads, self.d_head, self.d_kv_latent
+        )
+
+        # (n_h, d_m, d_h) * (n_h, d_h, d_c) -> (n_h, d_m, d_c)
+        self.out_uv_combined = torch.matmul(o_weight, uv_weight)
+
+        # free up memory here
+        del self.q_proj
+        del self.upsample_key
+        del self.out_proj
+        del self.upsample_value
+
+        self.q_proj = None
+        self.upsample_key = None
+        self.out_proj = None
+        self.upsample_value = None
+
     def forward_no_cache(self, x: torch.Tensor) -> torch.Tensor:
+        assert self.q_proj is not None
+        assert self.upsample_key is not None
+        assert self.upsample_value is not None
+        assert self.out_proj is not None
+
         # assumption: x represents the entire sequence
         batch_size, seq_len, _ = x.shape
 
@@ -307,37 +379,7 @@ class MultiHeadLatentAttention(BaseAttention):
                 device=self.device,
             )
 
-            # cache W^Q^T @ W_UK over the head dimension to avoid recomputation
-            # (d_h * n_h, d_m) -> (n_h, d_h, d_m)
-            q_weight = self.q_proj.weight.view(
-                self.num_heads, self.d_head, self.d_model
-            )
-            # (n_h, d_h, d_m) -> (n_h, d_m, d_h)
-            q_weight = q_weight.transpose(1, 2)
-
-            # (d_h * n_h, d_c) -> (n_h, d_h, d_c)
-            uk_weight = self.upsample_key.weight.view(
-                self.num_heads, self.d_head, self.d_kv_latent
-            )
-
-            # (n_h, d_m, d_h) * (n_h, d_h, d_c) -> (n_h, d_m, d_c)
-            self.q_uk_combined = torch.matmul(q_weight, uk_weight)
-
-            # cache W_O @ W_UV over the head dimension to avoid recomputation
-            # (d_m, d_h * n_h) -> (d_m, n_h, d_h)
-            o_weight = self.out_proj.weight.view(
-                self.d_model, self.num_heads, self.d_head
-            )
-            # (d_m, n_h, d_h) -> (n_h, d_m, d_h)
-            o_weight = o_weight.transpose(0, 1)
-
-            # (d_h * n_h, d_c) -> (n_h, d_h, d_c)
-            uv_weight = self.upsample_value.weight.view(
-                self.num_heads, self.d_head, self.d_kv_latent
-            )
-
-            # (n_h, d_m, d_h) * (n_h, d_h, d_c) -> (n_h, d_m, d_c)
-            self.out_uv_combined = torch.matmul(o_weight, uv_weight)
+            self._prepare_cache_matrices()
 
         assert self.latent_cache is not None
         assert self.q_uk_combined is not None
@@ -365,6 +407,7 @@ class MultiHeadLatentAttention(BaseAttention):
         value_part = torch.matmul(
             self.out_uv_combined, all_latents_expanded.transpose(2, 3)
         )
+
         # (b, n_h, d_m, s_t) -> (b, n_h, s_t, d_m)
         value_part = value_part.transpose(2, 3)
 
@@ -397,8 +440,8 @@ class MultiHeadLatentAttention(BaseAttention):
 
         return output
 
-    def forward(self, x: torch.Tensor, use_cache: bool) -> torch.Tensor:
-        if use_cache:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_cache:
             return self.forward_with_cache(x)
         else:
             return self.forward_no_cache(x)

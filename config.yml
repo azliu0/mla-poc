@@ -13,7 +13,7 @@
     vocab_size: 102400
     d_model: 4096
     d_head: 64
-    d_kv_latent: 512
+    d_kv_latent: 128
     num_heads: 64
     num_layers: 30
     max_seq_length: 2048

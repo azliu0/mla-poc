@@ -63,6 +63,7 @@ class ModelBlock(nn.Module):
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
                 device=device,
+                use_cache=use_cache,
             )
         else:
             self.attn = MultiHeadLatentAttention(
@@ -73,6 +74,7 @@ class ModelBlock(nn.Module):
                 max_seq_len=max_seq_len,
                 d_kv_latent=d_kv_latent,
                 device=device,
+                use_cache=use_cache,
             )
         self.use_cache = use_cache
         self.norm1 = nn.LayerNorm(d_model)
@@ -85,7 +87,7 @@ class ModelBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_output: torch.Tensor = self.attn(x, use_cache=self.use_cache)
+        attn_output: torch.Tensor = self.attn(x)
         x = self.norm1(x + attn_output)
 
         ffn_output: torch.Tensor = self.ffn(x)

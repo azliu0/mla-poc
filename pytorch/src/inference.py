@@ -269,7 +269,6 @@ def benchmark_models(
             limit_batches=20,
         )
     )
-    no_cache_avg_mem = summaries[-1]["avg_memory_gib"]
 
     summaries.append(
         run_benchmark(
@@ -281,7 +280,7 @@ def benchmark_models(
             use_mla=True,
         )
     )
-    mla_kv_cache_avg_mem = summaries[-1]["avg_memory_gib"]
+
     summaries.append(
         run_benchmark(
             "kv-cache",
@@ -292,8 +291,8 @@ def benchmark_models(
             use_mla=False,
         )
     )
-    no_mla_kv_cache_avg_mem = summaries[-1]["avg_memory_gib"]
 
+    print("\n\n")
     print(
         f"{'model':<15} {'initial latency':<20} {'initial memory':<20} {'avg latency':<20} {'avg memory':<20}"
     )
@@ -304,12 +303,36 @@ def benchmark_models(
             f"{summary['name']:<15} {summary['initial_latency_ms']:.2f} ms{'':<10} {summary['initial_memory_gib']:.2f} GiB{'':<10} {summary['avg_latency_ms']:.2f} ms{'':<10} {summary['avg_memory_gib']:.2f} GiB{'':<10}"
         )
 
+    kv_cache_size = (
+        2
+        * config.max_batch_size
+        * config.max_seq_length
+        * config.num_heads
+        * config.d_head
+        * 4  # bytes per param
+        / 1024
+        / 1024
+    )
+    mla_kv_cache_size = (
+        config.max_batch_size
+        * config.max_seq_length
+        * config.d_kv_latent
+        * 4  # bytes per param
+        / 1024
+        / 1024
+    )
+    print("\n\n")
     print(
         "mla kv-cache size",
-        mla_kv_cache_avg_mem - no_cache_avg_mem,
-        "GiB",
+        mla_kv_cache_size,
+        "MiB",
     )
-    print("no mla kv-cache size", no_mla_kv_cache_avg_mem - no_cache_avg_mem, "GiB")
+    print(
+        "kv-cache size",
+        kv_cache_size,
+        "MiB",
+    )
+    print(f"{'% reduction':<15} {(1 - mla_kv_cache_size / kv_cache_size) * 100:.2f}%")
 
 
 def generate_input(config: ModelConfig) -> tuple[torch.Tensor, list[torch.Tensor]]:
