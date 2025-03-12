@@ -70,7 +70,7 @@ now, all matrix multiplies on the axis $s_t$ use dimensions that are strictly sm
 ## results
 
 - slow mla implementation, i.e. without rearranging the computation: https://github.com/azliu0/mla-poc/blob/f2b16b00a5cf2f73c7c4d9af27ee47a99998f9b6/pytorch/src/attention.py#L370
-- fast mla implementation, i.e. with rearranged computation: https://github.com/azliu0/mla-poc/blob/f2b16b00a5cf2f73c7c4d9af27ee47a99998f9b6/pytorch/src/attention.py#L324
+- fast mla implementation, i.e. with rearranged computation: https://github.com/azliu0/mla-poc/blob/f6a0f35d8e467be36ae038c5a26496e49fde1b9f/pytorch/src/attention.py#L443
 
 see model parameters [here](https://github.com/azliu0/mla-poc/blob/main/config.yml). all benchmarks on a 7B architecture which is roughly deepseek-llm-7b-base (adjusted to support mla).
 
