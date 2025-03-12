@@ -4,25 +4,25 @@
 
 from the paper: "$W^{UK}$ can be absorbed into $W^Q$ and $W^{UV}$ can be absorbed into $W^O$", which is the crux of the implementation.
 
-$$
+```math
 \begin{align*}
 q_{ti}^Tk_{jk} &= (W_Q^ih_t)^T(W^{UKi}W^{DKVi}h_j) \\
 &= h_t^T(W_{Q}^{Ti}W^{UKi})(W^{DKVi}h_j) \\
 &= h_t^T\tilde{W}_Q^i c_{tj}
 \end{align*}
-$$
+```
 
-$c_{tj}$ is cached and we can precompute $\tilde{W}_Q$. the index $i$ is the head index, i.e., $W_Q^i = W_Q[i * d_h : (i + 1) * d_h, :]$, so in practice we have to reshape $W_Q \rightarrow (n_h, d_h, d_m)$ and $W^{UK} \rightarrow (n_h, d_h, d_{kv})$ before computing their product.
+$c_{tj}$ is cached and we can precompute $\tilde{W}\_Q$. the index $i$ is the head index, i.e., $W_Q^i = W_Q[i * d_h : (i + 1) * d_h, :]$, so in practice we have to reshape $W_Q \rightarrow (n_h, d_h, d_m)$ and $W^{UK} \rightarrow (n_h, d_h, d\_{kv})$ before computing their product.
 
 as a sanity check, we also have to make sure that the computation at inference-time is flop efficient, i.e. roughly the same as normal attention.
 
 since we're computing the product over the entire token space, we expect this matrix multiply to look like this:
 
-$$
+```math
 \begin{align*}
 (b, n_h, s_x, d_m) \times (b, n_h, d_m, d_c) \times (b, n_h, d_c, s_t) \\ \rightarrow (b, n_h, s_x, s_t)
 \end{align*}
-$$
+```
 
 where $s_x$ is the length of the incoming tokens and $s_t$ is the total sequence length.
 
@@ -30,11 +30,11 @@ what we want to avoid is the amount of computation that we do in the $s_t$ dimen
 
 absorbing $W^{UV}$ into $W^O$:
 
-$$
+```math
 \begin{align*}
 W_O[u_{t,1}, \ldots, u_{t,s_t}] = \sum_{i=1}^{n_h}\sum_{j=1}^{s_t} \alpha_{t,i,j} W_O^iW^{UVi}c_{j,i}
 \end{align*}
-$$
+```
 
 so we should precompute $\tilde{W}_O = [W_O^i W^{UVi}]_{i=1}^{n_h}$ which has size $(n_h, d_m, d_c)$.
 
@@ -47,13 +47,13 @@ this is flop inefficient, since the second step multiplies $s_t$ and $d_m$ toget
 
 instead, we need to rearrange the computation to first eliminate $s_t$ before $\tilde{W}_Oc$. this can be done with a bit of linear algebra:
 
-$$
+```math
 \begin{align*}
 u_t^i[k] &= \sum_{j=1}^{s_t} \alpha_{t,i,j}(\tilde{W}_O^ic_{j,i})[k] \\
 &= \sum_{j=1}^{s_t} \alpha_{t,i,j}\left(\sum_{l=1}^{d_c} \tilde{W}_O^i[k,l]c_{j,i}[l]\right) \\
 &= \sum_{l=1}^{d_c} \tilde{W}_O^i[k,l]\left(\sum_{j=1}^{s_t} \alpha_{t,i,j}c_{j,i}[l]\right) \\
-\end{align*}.
-$$
+\end{align*}
+```
 
 In other words,
 ```math
