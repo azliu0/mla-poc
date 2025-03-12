@@ -67,6 +67,21 @@ so our inference-time implementation is:
 
 now, all matrix multiplies on the axis $s_t$ use dimensions that are strictly smaller than $d_m$, so this implementation is flop efficient. in the analysis below, we show that it is now essentially the same as normal attention.
 
+## results
+
+- slow mla implementation, i.e. without rearranging the computation: https://github.com/azliu0/mla-poc/blob/f2b16b00a5cf2f73c7c4d9af27ee47a99998f9b6/pytorch/src/attention.py#L370
+- fast mla implementation, i.e. with rearranged computation: https://github.com/azliu0/mla-poc/blob/f2b16b00a5cf2f73c7c4d9af27ee47a99998f9b6/pytorch/src/attention.py#L324
+
+see model parameters [here](https://github.com/azliu0/mla-poc/blob/main/config.yml). all benchmarks on a 7B architecture which is roughly deepseek-llm-7b-base (adjusted to support mla).
+
+full results on single gpu `NVIDIA A100 80GB PCIe`:
+
+| model | latency | memory | flops | kv-cache size |
+|-------|-------------|------------|-----------|---------------|
+| no-cache | 999.01 ms | 26.73 GiB | 1364.08B | n/a |
+| kv-cache | 40.44 ms | 27.94 GiB | 33.87B | 1920.0 MiB |
+| mla+kv-cache (slow) | 228.44 ms | 27.40 GiB | 1364.08B | 30.0 MiB |
+| mla+kv-cache (fast) | 36.24 ms | 26.16 GiB | 35.52B | 30.0 MiB |
 
 ## flop analysis
 
