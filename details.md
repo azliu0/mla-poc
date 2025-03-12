@@ -36,7 +36,7 @@ W_O[u_{t,1}, \ldots, u_{t,s_t}] = \sum_{i=1}^{n_h}\sum_{j=1}^{s_t} \alpha_{t,i,j
 \end{align*}
 ```
 
-so we should precompute $\tilde{W}_O = [W_O^i W^{UVi}]_{i=1}^{n_h}$ which has size $(n_h, d_m, d_c)$.
+so we should precompute $\tilde{W}\_O = [W_O^i W^{UVi}]\_{i=1}^{n_h}$ which has size $(n_h, d_m, d_c)$.
 
 At inference-time, it's tempting to do the following:
 - compute scores $(h_t^T\tilde{W}_q)c$, which follows shape $(b, n_h, s_x, d_c) \times (b, n_h, d_c, s_t) \rightarrow (b, n_h, s_x, s_t)$
