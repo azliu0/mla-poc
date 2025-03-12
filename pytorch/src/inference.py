@@ -40,6 +40,13 @@ class Summary:
     initial_memory_gib: float
     avg_latency_ms: float
     avg_memory_gib: float
+    avg_flops: float
+
+
+@dataclass
+class InferenceOutput:
+    logits: Optional[torch.Tensor]
+    flops: int
 
 
 def load_config(config_path: Path, small: bool) -> ModelConfig:
@@ -49,13 +56,6 @@ def load_config(config_path: Path, small: bool) -> ModelConfig:
         return ModelConfig(**config["small"])
     else:
         return ModelConfig(**config["large"])
-
-
-def count_flops(
-    model: TransformerModel, input_ids: torch.Tensor, start_idx: Optional[int] = None
-):
-    with torch.no_grad():
-        return FlopCountAnalysis(model, (input_ids.to(DEVICE), start_idx)).total()
 
 
 def get_model(config: ModelConfig, use_cache: bool, use_mla: bool) -> TransformerModel:
@@ -74,15 +74,23 @@ def get_model(config: ModelConfig, use_cache: bool, use_mla: bool) -> Transforme
 
 
 def do_inference(
-    model: TransformerModel, input_ids: torch.Tensor, start_idx: Optional[int] = None
-) -> torch.Tensor:
+    model: TransformerModel,
+    input_ids: torch.Tensor,
+    start_idx: Optional[int],
+    count_flops: bool = False,
+) -> InferenceOutput:
     with torch.no_grad():
-        logits = model(input_ids, start_idx)
+        if count_flops:
+            logits = None
+            flops = FlopCountAnalysis(model, (input_ids, start_idx)).total()
+        else:
+            logits = model(input_ids, start_idx)
+            flops = 0
 
-    return logits
+    return InferenceOutput(logits=logits, flops=flops)
 
 
-def assert_close(a, b):
+def assert_close(a: torch.Tensor, b: torch.Tensor):
     assert torch.allclose(a, b, atol=1e-5), "logits differ!"
 
 
@@ -97,10 +105,16 @@ def test_mla_correctness(
     cache_model.load_state_dict(torch.load(TMP_MODEL_PATH))
 
     print("running correctness test for model with MLA:")
-    mla_logits_no_cache = do_inference(no_cache_model, input_ids)
-    mla_logits_cache = do_inference(cache_model, input_ids)
-
-    assert_close(mla_logits_cache, mla_logits_no_cache)
+    mla_logits_no_cache = do_inference(
+        no_cache_model, input_ids, start_idx=None, count_flops=False
+    )
+    mla_logits_cache = do_inference(
+        cache_model, input_ids, start_idx=None, count_flops=False
+    )
+    assert (
+        mla_logits_cache.logits is not None and mla_logits_no_cache.logits is not None
+    )
+    assert_close(mla_logits_cache.logits, mla_logits_no_cache.logits)
 
     current_sequence = input_ids.clone()
     current_position = input_ids.shape[1]
@@ -112,16 +126,21 @@ def test_mla_correctness(
             print(f"testing batch {i+1}/{len(follow_up_batches)}")
 
         current_sequence = torch.cat([current_sequence, follow_up_batch], dim=1)
-        mla_logits_followup_no_cache = do_inference(no_cache_model, current_sequence)
-        mla_logits_followup_no_cache = mla_logits_followup_no_cache[
+        mla_logits_followup_no_cache = do_inference(
+            no_cache_model, current_sequence, start_idx=None, count_flops=False
+        )
+        assert mla_logits_followup_no_cache.logits is not None
+        mla_logits_followup_no_cache.logits = mla_logits_followup_no_cache.logits[
             :, -follow_up_batch.shape[1] :
         ]
 
         mla_logits_followup_cache = do_inference(
-            cache_model, follow_up_batch, start_idx=current_position
+            cache_model, follow_up_batch, start_idx=current_position, count_flops=False
         )
-
-        assert_close(mla_logits_followup_cache, mla_logits_followup_no_cache)
+        assert mla_logits_followup_cache.logits is not None
+        assert_close(
+            mla_logits_followup_cache.logits, mla_logits_followup_no_cache.logits
+        )
         current_position += follow_up_batch.shape[1]
 
     print("MLA outputs match with and without cache ✓")
@@ -140,10 +159,17 @@ def test_no_mla_correctness(
     cache_model.load_state_dict(torch.load(TMP_MODEL_PATH))
 
     print("running correctness test for model without MLA:")
-    no_mla_logits_no_cache = do_inference(no_cache_model, input_ids)
-    no_mla_logits_cache = do_inference(cache_model, input_ids)
-
-    assert_close(no_mla_logits_cache, no_mla_logits_no_cache)
+    no_mla_logits_no_cache = do_inference(
+        no_cache_model, input_ids, start_idx=None, count_flops=False
+    )
+    no_mla_logits_cache = do_inference(
+        cache_model, input_ids, start_idx=None, count_flops=False
+    )
+    assert (
+        no_mla_logits_cache.logits is not None
+        and no_mla_logits_no_cache.logits is not None
+    )
+    assert_close(no_mla_logits_cache.logits, no_mla_logits_no_cache.logits)
 
     current_sequence = input_ids.clone()
     current_position = input_ids.shape[1]
@@ -155,16 +181,21 @@ def test_no_mla_correctness(
             print(f"testing batch {i+1}/{len(follow_up_batches)}")
 
         current_sequence = torch.cat([current_sequence, follow_up_batch], dim=1)
-        no_mla_logits_followup_no_cache = do_inference(no_cache_model, current_sequence)
-        no_mla_logits_followup_no_cache = no_mla_logits_followup_no_cache[
+        no_mla_logits_followup_no_cache = do_inference(
+            no_cache_model, current_sequence, start_idx=None, count_flops=False
+        )
+        assert no_mla_logits_followup_no_cache.logits is not None
+        no_mla_logits_followup_no_cache.logits = no_mla_logits_followup_no_cache.logits[
             :, -follow_up_batch.shape[1] :
         ]
 
         no_mla_logits_followup_cache = do_inference(
-            cache_model, follow_up_batch, start_idx=current_position
+            cache_model, follow_up_batch, start_idx=current_position, count_flops=False
         )
-
-        assert_close(no_mla_logits_followup_cache, no_mla_logits_followup_no_cache)
+        assert no_mla_logits_followup_cache.logits is not None
+        assert_close(
+            no_mla_logits_followup_cache.logits, no_mla_logits_followup_no_cache.logits
+        )
         current_position += follow_up_batch.shape[1]
 
     print("Non-MLA outputs match with and without cache ✓")
@@ -173,7 +204,14 @@ def test_no_mla_correctness(
 
 
 def run_benchmark(
-    name, config, input_ids, follow_up_batches, use_cache, use_mla, limit_batches=None
+    name: str,
+    config: ModelConfig,
+    input_ids: torch.Tensor,
+    follow_up_batches: list[torch.Tensor],
+    use_cache: bool,
+    use_mla: bool,
+    count_flops: bool,
+    limit_batches=None,
 ) -> Summary:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -189,9 +227,8 @@ def run_benchmark(
     end_time = torch.cuda.Event(enable_timing=True)
 
     start_time.record(stream=torch.cuda.current_stream())
-    flops = count_flops(model, input_ids)
+    _ = do_inference(model, input_ids, start_idx=None, count_flops=count_flops)
     end_time.record(stream=torch.cuda.current_stream())
-    print(f"  - flops: {flops / 1e9:.2f}B")
     torch.cuda.synchronize()
 
     initial_latency_ms = start_time.elapsed_time(end_time)
@@ -204,6 +241,7 @@ def run_benchmark(
     current_position = input_ids.shape[1]
     follow_up_latencies = []
     follow_up_memories = []
+    follow_up_flops = []
 
     current_sequence = input_ids.clone() if not model.use_cache else None
 
@@ -217,13 +255,20 @@ def run_benchmark(
         start_time.record(stream=torch.cuda.current_stream())
 
         if model.use_cache:
-            flops = count_flops(model, follow_up_batch, start_idx=current_position)
-            print(f"  - flops: {flops / 1e9:.2f}B")
+            flops = do_inference(
+                model,
+                follow_up_batch,
+                start_idx=current_position,
+                count_flops=count_flops,
+            ).flops
         else:
             assert current_sequence is not None
             current_sequence = torch.cat([current_sequence, follow_up_batch], dim=1)
-            flops = count_flops(model, current_sequence)
-            print(f"  - flops: {flops / 1e9:.2f}B")
+            flops = do_inference(
+                model, current_sequence, start_idx=None, count_flops=count_flops
+            ).flops
+
+        follow_up_flops.append(flops)
 
         end_time.record(stream=torch.cuda.current_stream())
         torch.cuda.synchronize()
@@ -243,6 +288,7 @@ def run_benchmark(
 
     avg_latency = sum(follow_up_latencies) / len(follow_up_latencies)
     avg_memory = sum(follow_up_memories) / len(follow_up_memories)
+    avg_flops = sum(follow_up_flops) / len(follow_up_flops)
 
     summary = Summary(
         name=name,
@@ -250,6 +296,7 @@ def run_benchmark(
         initial_memory_gib=initial_memory_gib,
         avg_latency_ms=avg_latency,
         avg_memory_gib=avg_memory,
+        avg_flops=avg_flops,
     )
 
     del model
@@ -261,7 +308,10 @@ def run_benchmark(
 
 @app.function(gpu="A100-80GB")
 def benchmark_models(
-    config: ModelConfig, input_ids: torch.Tensor, follow_up_batches: list[torch.Tensor]
+    config: ModelConfig,
+    input_ids: torch.Tensor,
+    follow_up_batches: list[torch.Tensor],
+    count_flops: bool,
 ):
     print(f"running benchmarks on {torch.cuda.get_device_name()}")
     print(
@@ -285,6 +335,7 @@ def benchmark_models(
             follow_up_batches,
             use_cache=False,
             use_mla=False,
+            count_flops=count_flops,
             limit_batches=20,
         )
     )
@@ -297,6 +348,7 @@ def benchmark_models(
             follow_up_batches,
             use_cache=True,
             use_mla=True,
+            count_flops=count_flops,
         )
     )
 
@@ -308,18 +360,19 @@ def benchmark_models(
             follow_up_batches,
             use_cache=True,
             use_mla=False,
+            count_flops=count_flops,
         )
     )
 
     print("\n\n")
     print(
-        f"{'model':<15} {'initial latency':<20} {'initial memory':<20} {'avg latency':<20} {'avg memory':<20}"
+        f"{'model':<15} {'initial latency':<20} {'initial memory':<20} {'avg latency':<20} {'avg memory':<20} {'avg flops':<20}"
     )
-    print("-" * 115)
+    print("-" * 135)
 
     for summary in summaries:
         print(
-            f"{summary.name:<15} {summary.initial_latency_ms:.2f} ms{'':<10} {summary.initial_memory_gib:.2f} GiB{'':<10} {summary.avg_latency_ms:.2f} ms{'':<10} {summary.avg_memory_gib:.2f} GiB{'':<10}"
+            f"{summary.name:<15} {summary.initial_latency_ms:.2f} ms{'':<10} {summary.initial_memory_gib:.2f} GiB{'':<10} {summary.avg_latency_ms:.2f} ms{'':<10} {summary.avg_memory_gib:.2f} GiB{'':<10} {summary.avg_flops / 1e9:.2f}B{'':<10}"
         )
 
     kv_cache_size = (
@@ -388,6 +441,11 @@ if __name__ == "__main__":
         action="store_true",
         help="run comprehensive benchmarks comparing no-cache, KV-cache, and MLA",
     )
+    parser.add_argument(
+        "--count-flops",
+        action="store_true",
+        help="count FLOPs",
+    )
     args = parser.parse_args()
 
     config_path = Path(__file__).parent.parent.parent / "config.yml"
@@ -403,4 +461,51 @@ if __name__ == "__main__":
     if args.benchmark:
         with modal.enable_output():
             with app.run():
-                benchmark_models.remote(large_config, input_ids, follow_up_batches)
+                benchmark_models.remote(
+                    large_config,
+                    input_ids,
+                    follow_up_batches,
+                    count_flops=args.count_flops,
+                )
+
+# rn the mla flops are inflated:
+# latency-mem-flops:
+# mla+kv-cache    228.44 ms           27.40 GiB           1364.08B
+# kv-cache        41.73 ms           27.94 GiB           33.87B
+# TODO: figure out why
+
+# flop calculation:
+# remember d_c=2d_h
+
+# normal:
+# - qkv: bs_xd_md_hn_h * 3
+# - scores: bn_hs_xd_hs_t
+# - context: bn_hs_xs_td_h
+# - out: bs_xn_hd_hd_m
+
+# total:
+# - bn_h
+# 	- 4\*d_hd_ms_x
+# 		- MLS
+# 	- 2\*s_xs_td_h
+# 		- MLS
+
+# mla:
+# - downsample: bs_xd_md_c
+# 	- ignore for now
+# - q_part: bn_hs_xd_md_c
+# - v_part: bn_hd_md_cs_t <- this is really bad, i think
+# - scores: bn_hs_xd_cs_t
+# - out: bn_hs_xs_td_m
+
+# total:
+# - bn_h
+# 	- s_xs_t
+# 		- d_m+d_c=3d_h
+# 		- MLS
+# 	- d_cs_td_m
+# 		- this is rly ugly bc of s_td_m
+# 		- MLL
+# 	- s_xd_md_c
+# 		- same as 2\*d_hd_ms_x
+# 		- MLS
