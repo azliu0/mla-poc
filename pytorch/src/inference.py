@@ -7,13 +7,16 @@ import os
 import argparse
 from typing import Optional
 import modal
+from fvcore.nn import FlopCountAnalysis  # type: ignore
 
 TMP_MODEL_PATH = Path("tmp/model.pth")
 REQUIREMENTS_PATH = Path(__file__).parent.parent / "requirements.txt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-image = modal.Image.debian_slim(python_version="3.12").pip_install_from_requirements(
-    str(REQUIREMENTS_PATH)
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .pip_install_from_requirements(str(REQUIREMENTS_PATH))
 )
 app = modal.App(name="mla-poc-pytorch", image=image)
 
@@ -30,6 +33,15 @@ class ModelConfig:
     max_batch_size: int
 
 
+@dataclass
+class Summary:
+    name: str
+    initial_latency_ms: float
+    initial_memory_gib: float
+    avg_latency_ms: float
+    avg_memory_gib: float
+
+
 def load_config(config_path: Path, small: bool) -> ModelConfig:
     with open(config_path, "r") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)[0]
@@ -39,8 +51,15 @@ def load_config(config_path: Path, small: bool) -> ModelConfig:
         return ModelConfig(**config["large"])
 
 
+def count_flops(
+    model: TransformerModel, input_ids: torch.Tensor, start_idx: Optional[int] = None
+):
+    with torch.no_grad():
+        return FlopCountAnalysis(model, (input_ids.to(DEVICE), start_idx)).total()
+
+
 def get_model(config: ModelConfig, use_cache: bool, use_mla: bool) -> TransformerModel:
-    model = TransformerModel(
+    return TransformerModel(
         vocab_size=config.vocab_size,
         d_model=config.d_model,
         d_head=config.d_head,
@@ -52,7 +71,6 @@ def get_model(config: ModelConfig, use_cache: bool, use_mla: bool) -> Transforme
         use_cache=use_cache,
         device=DEVICE,
     ).to(DEVICE)
-    return model
 
 
 def do_inference(
@@ -156,7 +174,7 @@ def test_no_mla_correctness(
 
 def run_benchmark(
     name, config, input_ids, follow_up_batches, use_cache, use_mla, limit_batches=None
-):
+) -> Summary:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
@@ -171,14 +189,15 @@ def run_benchmark(
     end_time = torch.cuda.Event(enable_timing=True)
 
     start_time.record(stream=torch.cuda.current_stream())
-    logits = do_inference(model, input_ids)
+    flops = count_flops(model, input_ids)
     end_time.record(stream=torch.cuda.current_stream())
+    print(f"  - flops: {flops / 1e9:.2f}B")
     torch.cuda.synchronize()
 
     initial_latency_ms = start_time.elapsed_time(end_time)
     initial_memory_gib = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
 
-    print(f"{name} initial inference:")
+    print(f"{name} setup:")
     print(f"  - latency: {initial_latency_ms:.2f} ms")
     print(f"  - memory: {initial_memory_gib:.2f} GiB")
 
@@ -198,12 +217,13 @@ def run_benchmark(
         start_time.record(stream=torch.cuda.current_stream())
 
         if model.use_cache:
-            logits = do_inference(model, follow_up_batch, start_idx=current_position)
+            flops = count_flops(model, follow_up_batch, start_idx=current_position)
+            print(f"  - flops: {flops / 1e9:.2f}B")
         else:
             assert current_sequence is not None
             current_sequence = torch.cat([current_sequence, follow_up_batch], dim=1)
-            logits = do_inference(model, current_sequence)
-            logits = logits[:, -follow_up_batch.shape[1] :]
+            flops = count_flops(model, current_sequence)
+            print(f"  - flops: {flops / 1e9:.2f}B")
 
         end_time.record(stream=torch.cuda.current_stream())
         torch.cuda.synchronize()
@@ -224,17 +244,16 @@ def run_benchmark(
     avg_latency = sum(follow_up_latencies) / len(follow_up_latencies)
     avg_memory = sum(follow_up_memories) / len(follow_up_memories)
 
-    summary = {
-        "name": name,
-        "initial_latency_ms": initial_latency_ms,
-        "initial_memory_gib": initial_memory_gib,
-        "avg_latency_ms": avg_latency,
-        "avg_memory_gib": avg_memory,
-    }
+    summary = Summary(
+        name=name,
+        initial_latency_ms=initial_latency_ms,
+        initial_memory_gib=initial_memory_gib,
+        avg_latency_ms=avg_latency,
+        avg_memory_gib=avg_memory,
+    )
 
     del model
     del current_sequence
-    del logits
     torch.cuda.empty_cache()
 
     return summary
@@ -256,7 +275,7 @@ def benchmark_models(
     # input_ids lose their device during modal's pickling
     input_ids = input_ids.to(DEVICE)
 
-    summaries = []
+    summaries: list[Summary] = []
 
     summaries.append(
         run_benchmark(
@@ -300,7 +319,7 @@ def benchmark_models(
 
     for summary in summaries:
         print(
-            f"{summary['name']:<15} {summary['initial_latency_ms']:.2f} ms{'':<10} {summary['initial_memory_gib']:.2f} GiB{'':<10} {summary['avg_latency_ms']:.2f} ms{'':<10} {summary['avg_memory_gib']:.2f} GiB{'':<10}"
+            f"{summary.name:<15} {summary.initial_latency_ms:.2f} ms{'':<10} {summary.initial_memory_gib:.2f} GiB{'':<10} {summary.avg_latency_ms:.2f} ms{'':<10} {summary.avg_memory_gib:.2f} GiB{'':<10}"
         )
 
     kv_cache_size = (
