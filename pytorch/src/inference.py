@@ -509,3 +509,27 @@ if __name__ == "__main__":
 # 	- s_xd_md_c
 # 		- same as 2\*d_hd_ms_x
 # 		- MLS
+
+# mla faster:
+# - downsample: bs_xd_md_c
+# - q_part: bn_hs_xd_md_c
+# - scores: bn_hs_xd_cs_t
+# - out1: bn_hs_xs_td_c
+# - out2: bn_hs_xd_cd_m
+
+# total:
+# - bs_xd_md_c
+# 	- in practice negligible due to missing n_h term
+# - bn_hs_x
+# 	- 2*d_md_c+2*s_td_c
+# 	- 2*SML + 2*SML
+#   - for direct comparison with normal attn, d_c=2*d_h, i.e.
+#     - 4*d_md_h + 4*s_td_h
+
+# flops(mla) = flops(normal) + 2*bn_hs_xs_td_h
+# overhead ~ 2*64*5*2048*64 * num_layers = 80M flops * num_layers = 2.4B flops
+
+# in practice, we observe
+# mla+kv-cache->35.52B flops
+# kv-cache->33.87B flops
+# so the napkin math checks out
