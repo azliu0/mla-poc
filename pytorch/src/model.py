@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .encoder import ModelEncoder
+from .decoder import ModelDecoder
 from typing import Optional
 import math
 
@@ -21,8 +21,11 @@ class PositionalEncoding(nn.Module):
 
         self.register_buffer("pe", pe)
 
-    def forward(self, x):
-        return x + self.pe[:, : x.size(1), :]
+    def forward(self, x, start_idx: Optional[int] = None):
+        if start_idx is not None:
+            return x + self.pe[:, start_idx : x.size(1) + start_idx, :]
+        else:
+            return x + self.pe[:, : x.size(1), :]
 
 
 class TransformerModel(nn.Module):
@@ -34,23 +37,31 @@ class TransformerModel(nn.Module):
         num_heads: int,
         num_layers: int,
         max_seq_length: int,
-        d_kv_latent: Optional[int] = None,
+        max_batch_size: int,
+        d_kv_latent: Optional[int],
+        use_cache: bool,
     ):
         super().__init__()
 
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_length)
+        self.pos_encoding = PositionalEncoding(d_model=d_model, max_len=max_seq_length)
 
-        self.encoder = ModelEncoder(d_model, d_head, num_heads, num_layers, d_kv_latent)
+        self.decoder = ModelDecoder(
+            d_model=d_model,
+            d_head=d_head,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_length,
+            d_kv_latent=d_kv_latent,
+            use_cache=use_cache,
+        )
 
         self.output_projection = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x):
+    def forward(self, x, start_idx: Optional[int] = None):
         x = self.embedding(x)
-        x = self.pos_encoding(x)
-
-        encoded = self.encoder(x)
-
-        logits = self.output_projection(encoded)
-
+        x = self.pos_encoding(x, start_idx)
+        x = self.decoder(x)
+        logits = self.output_projection(x)
         return logits

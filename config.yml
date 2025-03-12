@@ -2,8 +2,9 @@
   params:
     vocab_size: 50000
     d_model: 1024
-    d_head: 64
+    d_head: 3
     d_kv_latent: 128
-    num_heads: 64
+    num_heads: 1
     num_layers: 4
-    max_seq_length: 2048
+    max_seq_length: 6
+    max_batch_size: 1
