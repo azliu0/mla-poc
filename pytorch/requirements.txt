@@ -3,3 +3,4 @@ matplotlib==3.10.1
 numpy==2.2.3
 pyyaml==6.0.2
 tqdm==4.67.1
+modal==0.73.93

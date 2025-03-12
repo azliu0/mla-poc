@@ -15,6 +15,7 @@ class ModelDecoder(nn.Module):
         max_seq_len: int,
         d_kv_latent: Optional[int],
         use_cache: bool,
+        device: torch.device,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -27,6 +28,7 @@ class ModelDecoder(nn.Module):
                     max_seq_len=max_seq_len,
                     d_kv_latent=d_kv_latent,
                     use_cache=use_cache,
+                    device=device,
                 )
                 for _ in range(num_layers)
             ]
@@ -50,6 +52,7 @@ class ModelBlock(nn.Module):
         max_seq_len: int,
         d_kv_latent: Optional[int],
         use_cache: bool,
+        device: torch.device,
     ):
         super().__init__()
         if d_kv_latent is None:
@@ -59,6 +62,7 @@ class ModelBlock(nn.Module):
                 num_heads=num_heads,
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
+                device=device,
             )
         else:
             self.attn = MultiHeadLatentAttention(
@@ -68,6 +72,7 @@ class ModelBlock(nn.Module):
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
                 d_kv_latent=d_kv_latent,
+                device=device,
             )
         self.use_cache = use_cache
         self.norm1 = nn.LayerNorm(d_model)

@@ -10,11 +10,11 @@
     max_seq_length: 2048
     max_batch_size: 1
   large:
-    vocab_size: 50000
-    d_model: 1024
+    vocab_size: 102400
+    d_model: 4096
     d_head: 64
-    d_kv_latent: 128
+    d_kv_latent: 512
     num_heads: 64
-    num_layers: 12
+    num_layers: 30
     max_seq_length: 2048
     max_batch_size: 1

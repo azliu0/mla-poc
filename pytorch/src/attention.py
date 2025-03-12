@@ -23,12 +23,17 @@ class KVCache(Cache):
         max_seq_len: int,
         num_heads: int,
         head_dim: int,
+        device: torch.device,
     ):
         self.max_seq_len = max_seq_len
         self.cur_seq_len = 0
 
-        self.k_cache = torch.zeros((max_batch_size, max_seq_len, num_heads, head_dim))
-        self.v_cache = torch.zeros((max_batch_size, max_seq_len, num_heads, head_dim))
+        self.k_cache = torch.zeros(
+            (max_batch_size, max_seq_len, num_heads, head_dim), device=device
+        )
+        self.v_cache = torch.zeros(
+            (max_batch_size, max_seq_len, num_heads, head_dim), device=device
+        )
 
     def update(
         self, k_new: torch.Tensor, v_new: torch.Tensor, position: Optional[int] = None
@@ -54,11 +59,19 @@ class KVCache(Cache):
 class KVLatentCache(Cache):
     # The main difference for KVLatentCache is that we only need to store the latent values
     # The upsampled keys and values are computed later
-    def __init__(self, max_batch_size: int, max_seq_len: int, d_kv_latent: int):
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        d_kv_latent: int,
+        device: torch.device,
+    ):
         self.max_seq_len = max_seq_len
         self.cur_seq_len = 0
 
-        self.latent_cache = torch.zeros((max_batch_size, max_seq_len, d_kv_latent))
+        self.latent_cache = torch.zeros(
+            (max_batch_size, max_seq_len, d_kv_latent), device=device
+        )
 
     def update(self, latent: torch.Tensor, position: Optional[int] = None) -> None:
         batch_size, seq_len, _ = latent.shape
@@ -97,6 +110,7 @@ class MultiHeadAttention(BaseAttention):
         num_heads: int,
         max_batch_size: int,
         max_seq_len: int,
+        device: torch.device,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -112,6 +126,7 @@ class MultiHeadAttention(BaseAttention):
         self.v_proj = nn.Linear(d_model, d_head * num_heads)
         self.out_proj = nn.Linear(d_head * num_heads, d_model)
 
+        self.device = device
         self.kv_cache = None
 
     def forward_no_cache(self, x: torch.Tensor) -> torch.Tensor:
@@ -130,7 +145,8 @@ class MultiHeadAttention(BaseAttention):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
 
         causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+            torch.ones(seq_len, seq_len, device=self.device, dtype=torch.bool),
+            diagonal=1,
         )
         scores = scores.masked_fill(causal_mask, float("-inf"))
 
@@ -153,6 +169,7 @@ class MultiHeadAttention(BaseAttention):
                 max_seq_len=self.max_seq_len,
                 num_heads=self.num_heads,
                 head_dim=self.d_head,
+                device=self.device,
             )
 
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.d_head)
@@ -177,7 +194,7 @@ class MultiHeadAttention(BaseAttention):
         # (s_x, s_t)
         total_seq_len = k.size(-2)
         causal_mask = torch.triu(
-            torch.ones(seq_len, total_seq_len, device=x.device, dtype=torch.bool),
+            torch.ones(seq_len, total_seq_len, device=self.device, dtype=torch.bool),
             diagonal=1 + total_seq_len - seq_len,
         )
 
@@ -212,6 +229,7 @@ class MultiHeadLatentAttention(BaseAttention):
         max_batch_size: int,
         max_seq_len: int,
         d_kv_latent: int,
+        device: torch.device,
     ):
         super().__init__()
         self.d_model = d_model
@@ -228,6 +246,8 @@ class MultiHeadLatentAttention(BaseAttention):
 
         self.q_proj = nn.Linear(d_model, d_head * num_heads, bias=False)
         self.out_proj = nn.Linear(d_head * num_heads, d_model, bias=False)
+
+        self.device = device
 
         # Invariant: all three of these are None or populated
         self.latent_cache = None
@@ -257,7 +277,8 @@ class MultiHeadLatentAttention(BaseAttention):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
 
         causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+            torch.ones(seq_len, seq_len, device=self.device, dtype=torch.bool),
+            diagonal=1,
         )
         scores = scores.masked_fill(causal_mask, float("-inf"))
 
@@ -283,6 +304,7 @@ class MultiHeadLatentAttention(BaseAttention):
                 max_batch_size=self.max_batch_size,
                 max_seq_len=self.max_seq_len,
                 d_kv_latent=self.d_kv_latent,
+                device=self.device,
             )
 
             # cache W^Q^T @ W_UK over the head dimension to avoid recomputation
@@ -356,7 +378,7 @@ class MultiHeadLatentAttention(BaseAttention):
         # (s_x, s_t)
         total_seq_len = all_latents.size(-2)
         causal_mask = torch.triu(
-            torch.ones(seq_len, total_seq_len, device=x.device, dtype=torch.bool),
+            torch.ones(seq_len, total_seq_len, device=self.device, dtype=torch.bool),
             diagonal=1 + total_seq_len - seq_len,
         )
         scores = scores.masked_fill(causal_mask, float("-inf"))

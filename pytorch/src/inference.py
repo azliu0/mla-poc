@@ -6,8 +6,16 @@ import yaml
 import os
 import argparse
 from typing import Optional
+import modal
 
 TMP_MODEL_PATH = Path("tmp/model.pth")
+REQUIREMENTS_PATH = Path(__file__).parent.parent / "requirements.txt"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+image = modal.Image.debian_slim(python_version="3.12").pip_install_from_requirements(
+    str(REQUIREMENTS_PATH)
+)
+app = modal.App(name="mla-poc-pytorch", image=image)
 
 
 @dataclass
@@ -32,7 +40,7 @@ def load_config(config_path: Path, small: bool) -> ModelConfig:
 
 
 def get_model(config: ModelConfig, use_cache: bool, use_mla: bool) -> TransformerModel:
-    return TransformerModel(
+    model = TransformerModel(
         vocab_size=config.vocab_size,
         d_model=config.d_model,
         d_head=config.d_head,
@@ -42,7 +50,9 @@ def get_model(config: ModelConfig, use_cache: bool, use_mla: bool) -> Transforme
         d_kv_latent=config.d_kv_latent if use_mla else None,
         max_batch_size=config.max_batch_size,
         use_cache=use_cache,
-    )
+        device=DEVICE,
+    ).to(DEVICE)
+    return model
 
 
 def do_inference(
@@ -144,29 +154,175 @@ def test_no_mla_correctness(
     os.remove(TMP_MODEL_PATH)
 
 
-def benchmark_no_mla(
-    config: ModelConfig, input_ids: torch.Tensor, follow_up_input_ids: torch.Tensor
+def run_benchmark(
+    name, config, input_ids, follow_up_batches, use_cache, use_mla, limit_batches=None
 ):
-    model = get_model(config, use_cache=False, use_mla=False)
-    do_inference(model, input_ids)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    model = get_model(config, use_cache=use_cache, use_mla=use_mla)
+    print("num params:", sum(p.numel() for p in model.parameters()))
+
+    batches_to_use = follow_up_batches
+    if limit_batches is not None:
+        batches_to_use = follow_up_batches[:limit_batches]
+
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
+
+    start_time.record(stream=torch.cuda.current_stream())
+    logits = do_inference(model, input_ids)
+    end_time.record(stream=torch.cuda.current_stream())
+    torch.cuda.synchronize()
+
+    initial_latency_ms = start_time.elapsed_time(end_time)
+    initial_memory_gib = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
+
+    print(f"{name} initial inference:")
+    print(f"  - latency: {initial_latency_ms:.2f} ms")
+    print(f"  - memory: {initial_memory_gib:.2f} GiB")
+
+    current_position = input_ids.shape[1]
+    follow_up_latencies = []
+    follow_up_memories = []
+
+    current_sequence = input_ids.clone() if not model.use_cache else None
+
+    for i, follow_up_batch in enumerate(batches_to_use):
+        follow_up_batch = follow_up_batch.to(DEVICE)
+
+        torch.cuda.reset_peak_memory_stats()
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+
+        start_time.record(stream=torch.cuda.current_stream())
+
+        if model.use_cache:
+            logits = do_inference(model, follow_up_batch, start_idx=current_position)
+        else:
+            assert current_sequence is not None
+            current_sequence = torch.cat([current_sequence, follow_up_batch], dim=1)
+            logits = do_inference(model, current_sequence)
+            logits = logits[:, -follow_up_batch.shape[1] :]
+
+        end_time.record(stream=torch.cuda.current_stream())
+        torch.cuda.synchronize()
+
+        batch_latency_ms = start_time.elapsed_time(end_time)
+        batch_memory_gib = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
+
+        follow_up_latencies.append(batch_latency_ms)
+        follow_up_memories.append(batch_memory_gib)
+
+        current_position += follow_up_batch.shape[1]
+
+        if (i + 1) % 10 == 0 or i == 0 or i == len(batches_to_use) - 1:
+            print(f"{name} batch {i+1}/{len(batches_to_use)}:")
+            print(f"  - latency: {batch_latency_ms:.2f} ms")
+            print(f"  - memory: {batch_memory_gib:.2f} GiB")
+
+    avg_latency = sum(follow_up_latencies) / len(follow_up_latencies)
+    avg_memory = sum(follow_up_memories) / len(follow_up_memories)
+
+    summary = {
+        "name": name,
+        "initial_latency_ms": initial_latency_ms,
+        "initial_memory_gib": initial_memory_gib,
+        "avg_latency_ms": avg_latency,
+        "avg_memory_gib": avg_memory,
+    }
+
+    del model
+    del current_sequence
+    del logits
+    torch.cuda.empty_cache()
+
+    return summary
 
 
-def benchmark_mla(
-    config: ModelConfig, input_ids: torch.Tensor, follow_up_input_ids: torch.Tensor
+@app.function(gpu="A100-80GB")
+def benchmark_models(
+    config: ModelConfig, input_ids: torch.Tensor, follow_up_batches: list[torch.Tensor]
 ):
-    model = get_model(config, use_cache=True, use_mla=True)
-    do_inference(model, input_ids)
+    print(f"running benchmarks on {torch.cuda.get_device_name()}")
+    print(
+        f"model config: d_model={config.d_model}, layers={config.num_layers}, heads={config.num_heads}"
+    )
+    print(
+        f"sequence length: initial={input_ids.shape[1]}, follow-up batches={len(follow_up_batches)}"
+    )
+    print("-" * 80)
+
+    # input_ids lose their device during modal's pickling
+    input_ids = input_ids.to(DEVICE)
+
+    summaries = []
+
+    summaries.append(
+        run_benchmark(
+            "no-cache",
+            config,
+            input_ids,
+            follow_up_batches,
+            use_cache=False,
+            use_mla=False,
+            limit_batches=20,
+        )
+    )
+    no_cache_avg_mem = summaries[-1]["avg_memory_gib"]
+
+    summaries.append(
+        run_benchmark(
+            "mla+kv-cache",
+            config,
+            input_ids,
+            follow_up_batches,
+            use_cache=True,
+            use_mla=True,
+        )
+    )
+    mla_kv_cache_avg_mem = summaries[-1]["avg_memory_gib"]
+    summaries.append(
+        run_benchmark(
+            "kv-cache",
+            config,
+            input_ids,
+            follow_up_batches,
+            use_cache=True,
+            use_mla=False,
+        )
+    )
+    no_mla_kv_cache_avg_mem = summaries[-1]["avg_memory_gib"]
+
+    print(
+        f"{'model':<15} {'initial latency':<20} {'initial memory':<20} {'avg latency':<20} {'avg memory':<20}"
+    )
+    print("-" * 115)
+
+    for summary in summaries:
+        print(
+            f"{summary['name']:<15} {summary['initial_latency_ms']:.2f} ms{'':<10} {summary['initial_memory_gib']:.2f} GiB{'':<10} {summary['avg_latency_ms']:.2f} ms{'':<10} {summary['avg_memory_gib']:.2f} GiB{'':<10}"
+        )
+
+    print(
+        "mla kv-cache size",
+        mla_kv_cache_avg_mem - no_cache_avg_mem,
+        "GiB",
+    )
+    print("no mla kv-cache size", no_mla_kv_cache_avg_mem - no_cache_avg_mem, "GiB")
 
 
 def generate_input(config: ModelConfig) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    input_ids = torch.randint(0, config.vocab_size, (1, config.max_seq_length // 2))
+    input_ids = torch.randint(0, config.vocab_size, (1, config.max_seq_length // 2)).to(
+        DEVICE
+    )
     tokens_per_batch = 5
     max_follow_up_batches = 100
     remaining_tokens = config.max_seq_length - input_ids.shape[1]
     num_batches = min(max_follow_up_batches, remaining_tokens // tokens_per_batch)
 
     follow_up_batches = [
-        torch.randint(0, config.vocab_size, (1, tokens_per_batch))
+        torch.randint(0, config.vocab_size, (1, tokens_per_batch)).to(DEVICE)
         for _ in range(num_batches)
     ]
 
@@ -186,14 +342,9 @@ if __name__ == "__main__":
         help="run MLA correctness test",
     )
     parser.add_argument(
-        "--no-mla-benchmark",
+        "--benchmark",
         action="store_true",
-        help="run non-MLA latency and memory benchmark",
-    )
-    parser.add_argument(
-        "--mla-benchmark",
-        action="store_true",
-        help="run MLA latency and memory benchmark",
+        help="run comprehensive benchmarks comparing no-cache, KV-cache, and MLA",
     )
     args = parser.parse_args()
 
@@ -207,3 +358,7 @@ if __name__ == "__main__":
         test_no_mla_correctness(small_config, input_ids, follow_up_batches)
     if args.mla_correctness:
         test_mla_correctness(small_config, input_ids, follow_up_batches)
+    if args.benchmark:
+        with modal.enable_output():
+            with app.run():
+                benchmark_models.remote(large_config, input_ids, follow_up_batches)
