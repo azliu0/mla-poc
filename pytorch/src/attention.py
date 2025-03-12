@@ -440,6 +440,64 @@ class MultiHeadLatentAttention(BaseAttention):
 
         return output
 
+    def forward_with_cache_einsum(self, x: torch.Tensor) -> torch.Tensor:
+        # assumption: x represents new tokens, and the previous tokens are cached
+        batch_size, seq_len, _ = x.shape
+
+        if self.latent_cache is None:
+            self.latent_cache = KVLatentCache(
+                max_batch_size=self.max_batch_size,
+                max_seq_len=self.max_seq_len,
+                d_kv_latent=self.d_kv_latent,
+                device=self.device,
+            )
+
+            self._prepare_cache_matrices()
+
+        assert self.latent_cache is not None
+        assert self.q_uk_combined is not None
+        assert self.out_uv_combined is not None
+
+        # (b, s_x, d_m) -> (b, s_x, d_c)
+        new_latents = self.downsample(x)
+
+        self.latent_cache.update(new_latents, position=None)
+
+        # (b, s_t, d_c)
+        all_latents = self.latent_cache.get(batch_size)
+
+        # (b, s_x, d_m) * (n_h, d_m, d_c) -> (b, n_h, s_x, d_c)
+        query_part = torch.einsum("bxd,ndc->bnxc", x, self.q_uk_combined)
+
+        # (n_h, d_m, d_c) * (b, s_t, d_c) -> (b, n_h, s_t, d_m)
+        value_part = torch.einsum("ndc,btc->bntd", self.out_uv_combined, all_latents)
+
+        # (b, n_h, s_x, d_c) * (b, s_t, d_c) -> (b, n_h, s_x, s_t)
+        scores = torch.einsum("bnxc,bsc->bnxs", query_part, all_latents)
+        scores = scores / math.sqrt(self.d_head)
+
+        # (s_x, s_t)
+        total_seq_len = all_latents.size(-2)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, total_seq_len, device=self.device, dtype=torch.bool),
+            diagonal=1 + total_seq_len - seq_len,
+        )
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        # (b, n_h, s_x, s_t) softmaxed over the entire sequence
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # (b, n_h, s_x, s_t) * (b, n_h, s_t, d_m) -> (b, n_h, s_x, d_m)
+        output = torch.einsum("bnxs,bnsd->bnxd", attn_weights, value_part)
+
+        # (b, n_h, s_x, d_m) -> (b, s_x, n_h, d_m)
+        output = output.transpose(1, 2)
+
+        # (b, s_x, n_h, d_m) -> (b, s_x, d_m)
+        output = output.sum(dim=2)
+
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_cache:
             return self.forward_with_cache(x)
